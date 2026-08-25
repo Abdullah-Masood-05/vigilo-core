@@ -127,6 +127,7 @@ Rules that hold throughout:
 ## Requirements
 
 - Rust 1.97+
+- **Linker (Windows):** The crate configures `rust-lld` for fast linking. You can either install `llvm-tools` via `rustup component add llvm-tools` (recommended) or install [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
 - **ffmpeg and ffprobe on `PATH`** for `camera:` and `file:` sources. Frames
   are decoded in a subprocess and piped in as raw RGB24 rather than linking a C
   decoder. `dir:` sources need nothing, which is what CI uses.
