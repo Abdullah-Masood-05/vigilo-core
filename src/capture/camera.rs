@@ -22,7 +22,6 @@
 //!   frames. That is precisely why the real pipeline uses a latest-frame
 //!   `ArcSwap` slot and never a queue (§6 rule 3).
 
-use std::process::Command;
 
 use crate::config::CaptureConfig;
 use crate::error::{DetectError, Result};
@@ -44,6 +43,7 @@ pub struct CameraDevice {
 
 impl CameraDevice {
     /// What to hand ffmpeg after `video=`.
+    #[allow(dead_code)]
     fn selector(&self) -> &str {
         self.alt_name.as_deref().unwrap_or(&self.name)
     }
@@ -67,44 +67,161 @@ impl std::fmt::Display for CameraFormat {
 
 /// Enumerate video capture devices.
 pub fn list_devices() -> Result<Vec<CameraDevice>> {
-    if !cfg!(windows) {
-        return Err(DetectError::Camera(
-            "device enumeration is implemented for Windows/DirectShow only; \
-             use file:<clip> or dir:<frames> elsewhere"
-                .into(),
-        ));
-    }
+    #[cfg(windows)]
+    {
+        // ffmpeg prints the device list to stderr and then exits non-zero because
+        // the dummy input cannot be opened. That is the documented way to do this.
+        let out = super::quiet_command("ffmpeg")
+            .args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
+            .output()
+            .map_err(|e| {
+                DetectError::Camera(format!("could not run ffmpeg ({e}); it must be on PATH"))
+            })?;
 
-    // ffmpeg prints the device list to stderr and then exits non-zero because
-    // the dummy input cannot be opened. That is the documented way to do this.
-    let out = Command::new("ffmpeg")
-        .args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
-        .output()
-        .map_err(|e| {
-            DetectError::Camera(format!("could not run ffmpeg ({e}); it must be on PATH"))
-        })?;
-
-    let devices = parse_dshow_devices(&String::from_utf8_lossy(&out.stderr));
-    if devices.is_empty() {
-        return Err(DetectError::Camera(
-            "no video capture devices found. Check that the camera is not in use by another \
-             app, and that Windows camera privacy settings allow desktop apps"
-                .into(),
-        ));
+        let devices = parse_dshow_devices(&String::from_utf8_lossy(&out.stderr));
+        if devices.is_empty() {
+            return Err(DetectError::Camera(
+                "no video capture devices found. Check that the camera is not in use by another \
+                 app, and that Windows camera privacy settings allow desktop apps"
+                    .into(),
+            ));
+        }
+        Ok(devices)
     }
-    Ok(devices)
+    #[cfg(target_os = "macos")]
+    {
+        let out = super::quiet_command("ffmpeg")
+            .args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
+            .output()
+            .map_err(|e| {
+                DetectError::Camera(format!("could not run ffmpeg ({e}); it must be on PATH"))
+            })?;
+
+        let devices = parse_avfoundation_devices(&String::from_utf8_lossy(&out.stderr));
+        if devices.is_empty() {
+            return Err(DetectError::Camera(
+                "no video capture devices found. Check camera permissions in macOS System Settings"
+                    .into(),
+            ));
+        }
+        Ok(devices)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let devices = list_v4l2_devices();
+        if devices.is_empty() {
+            return Err(DetectError::Camera(
+                "no video capture devices found in /dev/video*. Check that camera is plugged in and accessible"
+                    .into(),
+            ));
+        }
+        Ok(devices)
+    }
 }
 
-/// Modes a device claims to support. Worth reading before trusting a config:
-/// asking for a combination the camera does not offer makes ffmpeg exit
-/// immediately rather than negotiate.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn list_v4l2_devices() -> Vec<CameraDevice> {
+    let mut devices = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/class/video4linux") {
+        let mut paths: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        paths.sort_by_key(|e| e.file_name());
+        for entry in paths {
+            let filename = entry.file_name();
+            let name_str = filename.to_string_lossy();
+            if let Some(idx_str) = name_str.strip_prefix("video") {
+                if let Ok(index) = idx_str.parse::<usize>() {
+                    let dev_path = format!("/dev/{name_str}");
+                    if std::path::Path::new(&dev_path).exists() {
+                        let name = std::fs::read_to_string(entry.path().join("name"))
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_else(|_| format!("Camera {index}"));
+                        devices.push(CameraDevice {
+                            index,
+                            name,
+                            alt_name: Some(dev_path),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if devices.is_empty() {
+        for i in 0..16 {
+            let p = format!("/dev/video{i}");
+            if std::path::Path::new(&p).exists() {
+                devices.push(CameraDevice {
+                    index: i,
+                    name: format!("Video Device {i}"),
+                    alt_name: Some(p),
+                });
+            }
+        }
+    }
+    devices
+}
+
+#[cfg(target_os = "macos")]
+fn parse_avfoundation_devices(text: &str) -> Vec<CameraDevice> {
+    let mut devices = Vec::new();
+    let mut in_video_section = false;
+    for line in text.lines() {
+        if line.contains("AVFoundation video devices:") {
+            in_video_section = true;
+            continue;
+        }
+        if line.contains("AVFoundation audio devices:") {
+            break;
+        }
+        if in_video_section {
+            if let Some(start_bracket) = line.rfind('[') {
+                if let Some(end_bracket) = line[start_bracket..].find(']') {
+                    let idx_str = &line[start_bracket + 1..start_bracket + end_bracket];
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        let name = line[start_bracket + end_bracket + 1..].trim();
+                        if !name.is_empty() {
+                            devices.push(CameraDevice {
+                                index: idx,
+                                name: name.to_string(),
+                                alt_name: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    devices
+}
+
+/// Modes a device claims to support.
 pub fn list_formats(device: &CameraDevice) -> Result<Vec<CameraFormat>> {
-    let out = Command::new("ffmpeg")
-        .args(["-hide_banner", "-f", "dshow", "-list_options", "true", "-i"])
-        .arg(format!("video={}", device.selector()))
-        .output()
-        .map_err(|e| DetectError::Camera(format!("could not run ffmpeg ({e})")))?;
-    Ok(parse_dshow_formats(&String::from_utf8_lossy(&out.stderr)))
+    #[cfg(windows)]
+    {
+        let out = super::quiet_command("ffmpeg")
+            .args(["-hide_banner", "-f", "dshow", "-list_options", "true", "-i"])
+            .arg(format!("video={}", device.selector()))
+            .output()
+            .map_err(|e| DetectError::Camera(format!("could not run ffmpeg ({e})")))?;
+        Ok(parse_dshow_formats(&String::from_utf8_lossy(&out.stderr)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = device;
+        Ok(vec![
+            CameraFormat {
+                codec: "raw".into(),
+                width: 1280,
+                height: 720,
+                fps: 30.0,
+            },
+            CameraFormat {
+                codec: "raw".into(),
+                width: 640,
+                height: 480,
+                fps: 30.0,
+            },
+        ])
+    }
 }
 
 /// Parse the device list out of ffmpeg's stderr.
@@ -112,6 +229,7 @@ pub fn list_formats(device: &CameraDevice) -> Result<Vec<CameraFormat>> {
 /// Audio devices are dropped. Devices ffmpeg tags `(none)` are kept — virtual
 /// cameras (OBS and friends) report that way, and excluding them would make
 /// `camera:<index>` mean something different from what the user just read.
+#[allow(dead_code)]
 fn parse_dshow_devices(text: &str) -> Vec<CameraDevice> {
     let mut devices: Vec<CameraDevice> = Vec::new();
     let mut last_was_kept = false;
@@ -167,6 +285,7 @@ fn parse_dshow_devices(text: &str) -> Vec<CameraDevice> {
 ///
 /// The `max` figures are the ones worth reporting — that is the ceiling the
 /// mode actually offers.
+#[allow(dead_code)]
 fn parse_dshow_formats(text: &str) -> Vec<CameraFormat> {
     let mut formats = Vec::new();
 
@@ -191,6 +310,7 @@ fn parse_dshow_formats(text: &str) -> Vec<CameraFormat> {
 
 /// Strip the `[in#0 @ 0x...]` / `[dshow @ 0x...]` prefix ffmpeg puts on every
 /// line. The tag has changed across ffmpeg versions, so match the shape.
+#[allow(dead_code)]
 fn strip_ffmpeg_prefix(line: &str) -> &str {
     let trimmed = line.trim();
     if trimmed.starts_with('[') {
@@ -201,6 +321,7 @@ fn strip_ffmpeg_prefix(line: &str) -> &str {
     trimmed
 }
 
+#[allow(dead_code)]
 fn field_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let start = line.find(key)? + key.len();
     let rest = &line[start..];
@@ -208,6 +329,7 @@ fn field_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     Some(&rest[..end]).filter(|s| !s.is_empty())
 }
 
+#[allow(dead_code)]
 fn unquote(s: &str) -> Option<&str> {
     s.strip_prefix('"')?.strip_suffix('"')
 }
@@ -246,17 +368,41 @@ impl CameraSource {
                 },
             )?;
 
-        let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-v", "error", "-nostdin", "-f", "dshow"])
-            // dshow drops frames and warns loudly without a real-time buffer.
-            .args(["-rtbufsize", "128M"]);
-        if cfg.prefer_mjpeg {
-            cmd.args(["-vcodec", "mjpeg"]);
+        let mut cmd = super::quiet_command("ffmpeg");
+        #[cfg(windows)]
+        {
+            cmd.args(["-v", "error", "-nostdin", "-f", "dshow"])
+                // dshow drops frames and warns loudly without a real-time buffer.
+                .args(["-rtbufsize", "128M"]);
+            if cfg.prefer_mjpeg {
+                cmd.args(["-vcodec", "mjpeg"]);
+            }
+            cmd.args(["-video_size", &format!("{}x{}", cfg.width, cfg.height)])
+                .args(["-framerate", &cfg.fps.to_string()])
+                .arg("-i")
+                .arg(format!("video={}", device.selector()));
         }
-        cmd.args(["-video_size", &format!("{}x{}", cfg.width, cfg.height)])
-            .args(["-framerate", &cfg.fps.to_string()])
-            .arg("-i")
-            .arg(format!("video={}", device.selector()));
+        #[cfg(target_os = "macos")]
+        {
+            cmd.args(["-v", "error", "-nostdin", "-f", "avfoundation"])
+                .args(["-framerate", &cfg.fps.to_string()])
+                .args(["-video_size", &format!("{}x{}", cfg.width, cfg.height)])
+                .arg("-i")
+                .arg(format!("{}:none", device.index));
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            cmd.args(["-v", "error", "-nostdin", "-f", "v4l2"]);
+            if cfg.prefer_mjpeg {
+                cmd.args(["-input_format", "mjpeg"]);
+            }
+            let default_dev = format!("/dev/video{}", device.index);
+            let dev = device.alt_name.as_deref().unwrap_or(&default_dev);
+            cmd.args(["-video_size", &format!("{}x{}", cfg.width, cfg.height)])
+                .args(["-framerate", &cfg.fps.to_string()])
+                .arg("-i")
+                .arg(dev);
+        }
 
         let label = format!("camera:{} ({})", device.index, device.name);
         let mut pipe = RawRgbPipe::spawn(label, cfg.width, cfg.height, cmd, true)?;

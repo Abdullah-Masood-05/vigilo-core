@@ -22,24 +22,27 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 
-use deepscreen_detect::capture::camera;
-use deepscreen_detect::config::Config;
-use deepscreen_detect::models::face::YuNet;
-use deepscreen_detect::models::gaze::GazeNet;
-use deepscreen_detect::models::objects::YoloxNano;
-use deepscreen_detect::models::pose::HeadPoseNet;
-use deepscreen_detect::error::{DetectError, Result};
-use deepscreen_detect::report::Latencies;
+use vigilo_core::capture::camera;
+use vigilo_core::config::Config;
+use vigilo_core::models::face::YuNet;
+use vigilo_core::models::gaze::GazeNet;
+use vigilo_core::models::objects::YoloxNano;
+use vigilo_core::models::pose::HeadPoseNet;
+use vigilo_core::error::{DetectError, Result};
+use vigilo_core::report::Latencies;
 use std::collections::BTreeMap;
 
-use deepscreen_detect::models::gaze::GazeOutcome;
-use deepscreen_detect::types::{FaceDetection, GateReason, SignalCoverage, Signals, SlotState};
-use deepscreen_detect::{Detector, SourceSpec};
+use vigilo_core::models::gaze::GazeOutcome;
+use vigilo_core::fusion;
+use vigilo_core::types::{
+    Event, FaceDetection, GateReason, SignalCoverage, Signals, SlotState, ViolationKind,
+};
+use vigilo_core::{Detector, SourceSpec};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "detect-cli",
-    about = "Harness for deepscreen-detect. No app, no browser, no camera required.",
+    about = "Harness for deepscreen-viewer's detection modules. No window, no camera required.",
     version
 )]
 struct Cli {
@@ -192,7 +195,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Bench { source, model, all, sweep_threads, iters, report } => {
             cmd_bench(&cfg, source.as_deref(), model.as_deref(), all, sweep_threads, iters, report)
         }
-        Cmd::Replay { path, expect } => cmd_replay(&path, &expect),
+        Cmd::Replay { path, expect } => cmd_replay(&cfg, &path, &expect),
         Cmd::Inspect { models } => cmd_inspect(&models),
         Cmd::Config { out } => cmd_config(&cfg, out),
     }
@@ -246,6 +249,61 @@ fn cmd_devices(formats: bool) -> Result<()> {
 // live
 // ---------------------------------------------------------------------------
 
+/// Per-slot `SlotState` counts over a live run.
+///
+/// `live` reported latency and frame counts but nothing about *which signals
+/// actually existed* on those frames — so a session where gaze was gated for
+/// nine minutes read exactly like one where it ran throughout. Counting the
+/// states the pipeline already publishes is the difference between a latency
+/// number and a baseline.
+#[derive(Default)]
+struct CoverageTally {
+    slots: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
+    gates: BTreeMap<GateReason, u64>,
+    frames: u64,
+}
+
+impl CoverageTally {
+    fn observe(&mut self, c: &SignalCoverage) {
+        self.frames += 1;
+        for (name, state) in [
+            ("face", c.face),
+            ("pose", c.pose),
+            ("gaze", c.gaze),
+            ("objects", c.objects),
+            ("identity", c.identity),
+        ] {
+            *self.slots.entry(name).or_default().entry(state.as_str()).or_default() += 1;
+        }
+        if let Some(reason) = c.gaze_gate {
+            *self.gates.entry(reason).or_default() += 1;
+        }
+    }
+
+    fn print(&self) {
+        if self.frames == 0 {
+            return;
+        }
+        println!("\nsignal coverage over {} detected frame(s):", self.frames);
+        for (slot, states) in &self.slots {
+            let breakdown: Vec<String> = states
+                .iter()
+                .map(|(s, n)| {
+                    format!("{s} {n} ({:.1}%)", 100.0 * *n as f64 / self.frames as f64)
+                })
+                .collect();
+            println!("  {slot:<9} {}", breakdown.join("   "));
+        }
+        if self.gates.is_empty() {
+            println!("  gaze gate  never fired");
+        } else {
+            let breakdown: Vec<String> =
+                self.gates.iter().map(|(r, n)| format!("{r:?} {n}")).collect();
+            println!("  gaze gate  {}", breakdown.join("   "));
+        }
+    }
+}
+
 struct LiveOpts {
     overlay: bool,
     paced: bool,
@@ -279,7 +337,7 @@ fn cmd_live(cfg: &Config, source: &str, opts: LiveOpts) -> Result<()> {
     );
 
     let mut cfg = cfg.clone();
-    cfg.models.fill_missing_from_dir("models");
+    cfg.models.fill_missing_from_dir("../models");
     for (slot, path) in [
         ("pose", &cfg.models.pose),
         ("gaze", &cfg.models.gaze),
@@ -312,6 +370,7 @@ fn cmd_live(cfg: &Config, source: &str, opts: LiveOpts) -> Result<()> {
     let mut seen = 0u64;
     let mut last_saved_seq = u64::MAX;
     let mut last_report = Instant::now();
+    let mut coverage = CoverageTally::default();
 
     while det.is_running() {
         if let Some(d) = det.latest() {
@@ -323,6 +382,7 @@ fn cmd_live(cfg: &Config, source: &str, opts: LiveOpts) -> Result<()> {
                 let nth = seen;
                 seen += 1;
                 last_saved_seq = d.frame.seq;
+                coverage.observe(&d.signals.produced_by);
                 if save_every.is_some_and(|n| n > 0 && nth.is_multiple_of(n)) {
                     save_frame(&d.frame, &d.signals.faces, &save_dir)?;
                     saved += 1;
@@ -380,6 +440,7 @@ fn cmd_live(cfg: &Config, source: &str, opts: LiveOpts) -> Result<()> {
         s.stats.detect_p95_us as f32 / 1000.0,
         s.stats.total_p50_us as f32 / 1000.0,
     );
+    coverage.print();
     if saved > 0 {
         println!("saved {saved} frame(s) to {}", save_dir.display());
     }
@@ -393,7 +454,7 @@ fn cmd_live(cfg: &Config, source: &str, opts: LiveOpts) -> Result<()> {
 /// preview window. Deliberately outside any hot path — this encodes on the
 /// capture thread and is only ever driven by an explicit `--save-every`.
 fn save_frame(
-    frame: &deepscreen_detect::Frame,
+    frame: &vigilo_core::Frame,
     detections: &[FaceDetection],
     dir: &std::path::Path,
 ) -> Result<()> {
@@ -427,7 +488,7 @@ fn put(img: &mut image::RgbImage, x: i64, y: i64, colour: [u8; 3]) {
     }
 }
 
-fn draw_rect(img: &mut image::RgbImage, b: &deepscreen_detect::BBox, colour: [u8; 3]) {
+fn draw_rect(img: &mut image::RgbImage, b: &vigilo_core::BBox, colour: [u8; 3]) {
     let (x0, y0) = (b.x.round() as i64, b.y.round() as i64);
     let (x1, y1) = ((b.x + b.w).round() as i64, (b.y + b.h).round() as i64);
     // Two pixels thick, so it survives JPEG at a glance.
@@ -469,7 +530,7 @@ fn cmd_record(cfg: &Config, source: &str, out: &PathBuf, max_frames: Option<u64>
     let fps = src.nominal_fps().unwrap_or(cfg.capture.fps as f32).max(1.0);
 
     let mut cfg = cfg.clone();
-    cfg.models.fill_missing_from_dir("models");
+    cfg.models.fill_missing_from_dir("../models");
     let face_path = cfg.models.face.clone().ok_or_else(|| {
         DetectError::Config("no face model: put models in models/ or set models.face".into())
     })?;
@@ -696,7 +757,7 @@ fn bench_models(
     let paths: Vec<PathBuf> = match model {
         Some(m) => vec![PathBuf::from(m)],
         None => {
-            let dir = PathBuf::from("models");
+            let dir = PathBuf::from("../models");
             let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
                 .map_err(|e| DetectError::io(&dir, e))?
                 .filter_map(|e| e.ok())
@@ -722,7 +783,7 @@ fn bench_models(
     out.push_str("|---|---|---|---|---|---|---|\n");
 
     for path in &paths {
-        match deepscreen_detect::models::bench_model(path, &cfg.runtime, iters as u32) {
+        match vigilo_core::models::bench_model(path, &cfg.runtime, iters as u32) {
             Ok(r) => {
                 let shape = r
                     .input_shapes
@@ -763,7 +824,7 @@ fn bench_models(
 // replay
 // ---------------------------------------------------------------------------
 
-fn cmd_replay(path: &PathBuf, expect: &[String]) -> Result<()> {
+fn cmd_replay(cfg: &Config, path: &PathBuf, expect: &[String]) -> Result<()> {
     let text = std::fs::read_to_string(path).map_err(|e| DetectError::io(path, e))?;
 
     let mut count = 0u64;
@@ -777,6 +838,7 @@ fn cmd_replay(path: &PathBuf, expect: &[String]) -> Result<()> {
     let mut slots: BTreeMap<&'static str, BTreeMap<&'static str, u64>> = BTreeMap::new();
     let mut gates: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut frames_with_face = 0u64;
+    let mut signals: Vec<Signals> = Vec::new();
 
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -810,6 +872,7 @@ fn cmd_replay(path: &PathBuf, expect: &[String]) -> Result<()> {
         if let Some(reason) = c.gaze_gate {
             *gates.entry(reason.as_str()).or_default() += 1;
         }
+        signals.push(s);
     }
 
     let span_ms = last_t.saturating_sub(first_t.unwrap_or(0));
@@ -849,15 +912,106 @@ fn cmd_replay(path: &PathBuf, expect: &[String]) -> Result<()> {
         }
     }
 
-    if !expect.is_empty() {
-        return Err(DetectError::Config(
-            "--expect needs the fusion layer, which arrives at build step 8; \
-             the recording above parsed cleanly"
-                .into(),
-        ));
+    // ---- fusion, zero inference -------------------------------------------
+    //
+    // This is what recording `Signals` was for: the decision layer runs over a
+    // real session in milliseconds, so tuning a threshold is edit TOML, re-run,
+    // diff. Tuning that requires re-running models does not get done.
+    let events = fusion::replay(&signals, cfg);
+
+    println!("\n  violation timeline:");
+    if events.is_empty() {
+        println!("    (none)");
     }
-    println!("\n(fusion arrives at build step 8 — this is a parse and coverage check)");
+    let mut started = 0usize;
+    for event in &events {
+        match event {
+            Event::ViolationStarted(v) => {
+                started += 1;
+                println!(
+                    "    {:>8.2}s  START  {:<18} {:<9} {}",
+                    v.t_start_ms as f32 / 1000.0,
+                    v.kind.as_str(),
+                    format!("{:?}", v.severity).to_lowercase(),
+                    v.subject.clone().unwrap_or_default()
+                );
+                for c in &v.contributing {
+                    println!("                     {:?}: {}", c.signal, c.detail);
+                }
+            }
+            Event::ViolationEnded(v) => {
+                let end = v.t_end_ms.unwrap_or(v.t_start_ms);
+                println!(
+                    "    {:>8.2}s  END    {:<18} after {:.2}s",
+                    end as f32 / 1000.0,
+                    v.kind.as_str(),
+                    (end.saturating_sub(v.t_start_ms)) as f32 / 1000.0
+                );
+            }
+            other => println!("    {other:?}"),
+        }
+    }
+    println!("\n  {started} violation(s)");
+
+    if !expect.is_empty() {
+        check_expectations(expect, &events)?;
+        println!("  all {} expectation(s) met", expect.len());
+    }
     Ok(())
+}
+
+/// Assert a `kind@secs` or `kind@start-end` expectation against a timeline.
+///
+/// A window rather than an instant, because the exact frame a hold timer
+/// expires on depends on the rate the clip was captured at. Pinning to a frame
+/// index would make every expectations file specific to one recording.
+fn check_expectations(expect: &[String], events: &[Event]) -> Result<()> {
+    for spec in expect {
+        let (kind_str, window) = spec.split_once('@').ok_or_else(|| {
+            DetectError::Config(format!("--expect {spec}: want KIND@SECS or KIND@START-END"))
+        })?;
+        let kind: ViolationKind = kind_str
+            .parse()
+            .map_err(|e| DetectError::Config(format!("--expect {spec}: {e}")))?;
+        let (lo, hi) = match window.split_once('-') {
+            Some((a, b)) => (parse_secs(a, spec)?, parse_secs(b, spec)?),
+            None => {
+                let t = parse_secs(window, spec)?;
+                (t - 1.5, t + 1.5)
+            }
+        };
+
+        let hit = events.iter().any(|e| match e {
+            Event::ViolationStarted(v) => {
+                let t = v.t_start_ms as f32 / 1000.0;
+                v.kind == kind && t >= lo && t <= hi
+            }
+            _ => false,
+        });
+        if !hit {
+            let seen: Vec<String> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::ViolationStarted(v) => {
+                        Some(format!("{}@{:.2}s", v.kind.as_str(), v.t_start_ms as f32 / 1000.0))
+                    }
+                    _ => None,
+                })
+                .collect();
+            return Err(DetectError::Config(format!(
+                "expected {} to start between {lo:.2}s and {hi:.2}s, but it did not. Saw: {}",
+                kind.as_str(),
+                if seen.is_empty() { "nothing".to_string() } else { seen.join(", ") }
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_secs(s: &str, spec: &str) -> Result<f32> {
+    s.trim().parse::<f32>().map_err(|_| {
+        DetectError::Config(format!("--expect {spec}: {s} is not a number of seconds"))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -866,7 +1020,7 @@ fn cmd_replay(path: &PathBuf, expect: &[String]) -> Result<()> {
 
 fn cmd_inspect(paths: &[PathBuf]) -> Result<()> {
     for path in paths {
-        let info = deepscreen_detect::models::inspect(path)?;
+        let info = vigilo_core::models::inspect(path)?;
         println!("\n{}", info.path.display());
         println!("  {:.1} KB", info.size_bytes as f64 / 1024.0);
 

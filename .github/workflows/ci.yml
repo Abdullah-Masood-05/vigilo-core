@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main, v2-vigilo-core]
+  pull_request:
+    branches: [main, v2-vigilo-core]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test & Lint (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev patchelf libasound2-dev
+
+      - name: Download model weights
+        shell: bash
+        run: |
+          mkdir -p models
+          curl -sSL -o models/face_detection_yunet_2023mar.onnx https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+          curl -sSL -o models/headpose_mobilenetv3_small.onnx https://github.com/yakhyo/head-pose-estimation/releases/download/weights/mobilenetv3_small.onnx
+          curl -sSL -o models/mobileone_s0_gaze.onnx https://github.com/yakhyo/gaze-estimation/releases/download/weights/mobileone_s0_gaze.onnx
+          curl -sSL -o models/yolox_nano.onnx https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.onnx
+          curl -sSL -o buffalo_sc.zip https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip
+          unzip -j buffalo_sc.zip w600k_mbf.onnx -d models
+          rm -f buffalo_sc.zip
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --release
+
+      - name: Run tests with cargo-nextest
+        run: cargo nextest run --release
+
+      - name: Build detect-cli harness
+        run: cargo build --release --bin detect-cli
+
+      - name: Upload detect-cli binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: detect-cli-${{ matrix.platform }}
+          path: |
+            target/release/detect-cli
+            target/release/detect-cli.exe
+          if-no-files-found: warn

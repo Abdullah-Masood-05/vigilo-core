@@ -1,48 +1,43 @@
-//! `deepscreen-detect` — camera frames in, proctoring violations out.
+//! `vigilo-core` — camera frames in, proctoring signals and violations out.
 //!
-//! This crate knows nothing about Tauri, React, the assessment flow, or the
-//! backend, and it never will (MODELS.md §0). That single constraint is what
-//! makes it possible to build and benchmark the whole detection module before
-//! touching the app, test it headless in CI, and tune it against recorded
-//! video rather than a live exam.
+//! High-performance multimodal exam proctoring and behavioral stream fusion
+//! engine in pure Rust. Zero UI, zero browser, zero Tauri.
 //!
-//! # Build status
+//! Originally developed as `deepscreen-detect`, battle-tested inside the
+//! `vigilo` desktop app (`deepscreen-viewer`), and now extracted as the pure
+//! engine foundation powering:
+//! - Native CLI harnesses (`detect-cli`)
+//! - Python PyPI package (`rustream` via PyO3 / Maturin)
+//! - Node.js npm package (`flapguard` via napi-rs)
+//! - Desktop applications (Vigilo / Tauri)
 //!
-//! Following the build order in MODELS.md §11. Each step is independently
-//! measurable; fusing steps loses track of what helped.
+//! # Architecture
 //!
-//! | Step | What | State |
-//! |---|---|---|
-//! | 1 | Crate skeleton, types, config, `detect-cli`, file replay | **done** |
-//! | 2 | Camera capture behind `FrameSource` | not started |
-//! | 3 | YuNet face detection + baseline bench | **done** (8.4 ms p50 CPU) |
-//! | 4 | Threading skeleton, `ArcSwap` frame bus, `Detector` | **done** |
-//! | 5 | DirectML | not started |
-//! | 6 | Pose + gaze | not started |
-//! | 7 | YOLO26n on its own worker | not started |
-//! | 8 | Fusion, record/replay tuning | not started |
-//! | 9 | ArcFace identity | not started |
-//! | 10 | Quantization | not started |
-//! | 11 | Tauri adapter | not started |
-//!
-//! Face detection runs through `detect-cli live` today. There is no `Detector` yet — it arrives with the threading skeleton at
-//! step 4. Until then the CLI drives a `FrameSource` directly, which is
-//! exactly what step 1 is for: proving the types, the config and the harness
-//! before any model or thread exists to blame.
+//! - [`capture`]: High-throughput frame sources (DirectShow camera, video files, MJPEG/directory replay)
+//! - [`pipeline`]: Lock-free `ArcSwap` triple-buffered frame bus, multithreaded detection workers
+//! - [`models`]: ONNX inference wrappers (YuNet face, GazeNet gaze, HeadPoseNet pose, YoloxNano objects, ArcFace identity)
+//! - [`fusion`]: Pure deterministic temporal decision engine ([`FusionEngine`]) with hysteresis, hold timers, and decaying scores
+//! - [`direction`]: Robust head yaw/pitch angular coordinate bucketing
+//! - [`config`]: User and developer threshold configurations with dynamic hot-reloading
+//! - [`config_store`]: Zero-dependency TOML settings persistence
+//! - [`types`]: Strictly-typed signals, events, bounding boxes, and violations
 
 pub mod capture;
 pub mod config;
+pub mod config_store;
 pub mod direction;
 pub mod error;
+pub mod fusion;
 pub mod models;
 pub mod pipeline;
 pub mod report;
 pub mod types;
 
 pub use capture::{FrameSource, SourceSpec};
-pub use config::Config;
+pub use config::{Config, DevThresholds, SettingsPayload, UserThresholds};
 pub use direction::{Axes, DebugDirections, DirectionTracker, FrameOfReference, Horizontal, Vertical};
 pub use error::{DetectError, Result};
+pub use fusion::FusionEngine;
 pub use pipeline::{Detected, Detector, DetectorBuilder};
 pub use report::{FrameStats, Latencies, LatencySummary, SessionReport, SignalStatus};
 pub use types::{
@@ -57,9 +52,4 @@ pub use types::{
 /// refusing to read them.
 ///
 /// **2**: `SignalCoverage` went from five booleans to five [`SlotState`]s.
-/// A v1 recording says `"face": true`, which will not deserialise, so old
-/// recordings are refused rather than half-read. That is the intent: `true`
-/// could not distinguish a slot that ran from one that was merely configured,
-/// so silently mapping it onto `Produced` would import the exact ambiguity the
-/// change removes.
 pub const SIGNALS_FORMAT_VERSION: u32 = 2;

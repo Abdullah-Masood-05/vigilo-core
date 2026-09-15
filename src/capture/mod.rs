@@ -15,6 +15,117 @@ use crate::config::CaptureConfig;
 use crate::error::{DetectError, Result};
 use crate::types::Frame;
 
+/// Spawn a helper process without letting Windows pop a console window for it.
+///
+/// `ffmpeg` and `ffprobe` are console subsystem executables. The app is a GUI
+/// process (`windows_subsystem = "windows"`), so it has no console of its own
+/// — and when a GUI process starts a console child, Windows helpfully
+/// **allocates a new console window** for it. The result is a black terminal
+/// appearing next to the app, once per probe and once per capture session,
+/// which looks exactly like a crash to anyone who did not write this.
+///
+/// `CREATE_NO_WINDOW` suppresses that. Every `Command` in this module must go
+/// through here; one that does not is a stray window on a tester's screen.
+///
+/// No-op on non-Windows, where the whole problem does not exist.
+/// Directory holding the bundled `ffmpeg.exe` / `ffprobe.exe`, once located.
+///
+/// A process-wide static rather than something threaded through `Config`,
+/// because this is not a tunable — it is a fact about where this installation
+/// put its files, discovered once at startup by whoever knows about resource
+/// directories. The library still resolves nothing itself (MODELS.md §9): the
+/// app tells it, exactly as it does for model paths.
+static FFMPEG_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// Point capture at a directory containing `ffmpeg.exe` and `ffprobe.exe`.
+///
+/// Call once, before opening any source. Later calls are ignored, so a stray
+/// second call cannot silently repoint a running pipeline at different
+/// binaries.
+pub fn set_ffmpeg_dir(dir: Option<std::path::PathBuf>) {
+    let _ = FFMPEG_DIR.set(dir);
+}
+
+/// Absolute path to a bundled helper, or `None` to fall back to `PATH`.
+///
+/// Bundled wins deliberately. A tester may well have some other ffmpeg on
+/// `PATH` — an ancient one, or a build without DirectShow — and "works on my
+/// machine but not theirs" traced to a stranger's ffmpeg version is not a bug
+/// anyone wants to debug remotely. The copy shipped alongside is the one that
+/// was tested.
+fn bundled(program: &str) -> Option<std::path::PathBuf> {
+    let dir = FFMPEG_DIR.get()?.as_ref()?;
+    let exe = if cfg!(windows) {
+        dir.join(format!("{program}.exe"))
+    } else {
+        dir.join(program)
+    };
+    exe.exists().then_some(exe)
+}
+
+pub(crate) fn quiet_command(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = match bundled(program) {
+        Some(path) => std::process::Command::new(path),
+        None => std::process::Command::new(program),
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// `CREATE_NO_WINDOW`, from `winbase.h`. Spelled out rather than
+        /// pulling in the `windows-sys` crate for one constant.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Is `ffmpeg` itself usable — bundled or on `PATH`?
+///
+/// **Deliberately does not check `ffprobe`.** The camera path — what every
+/// installed copy of this app actually uses — never calls it; only `file:`
+/// replay does, to read a clip's dimensions, and that is a development-only
+/// source never exposed through the installed app's normal launch. Since
+/// §22's minimal build ships `ffmpeg.exe` alone, requiring `ffprobe` here
+/// would fail every fresh install for a binary the camera path never touches.
+///
+/// Still checked even though the installer ships its own `ffmpeg.exe`: a build
+/// run from a source tree has no bundle, and an install with a deleted or
+/// blocked `ffmpeg/` folder should say so rather than fail at the first frame.
+pub fn ffmpeg_available() -> bool {
+    binary_runs("ffmpeg")
+}
+
+fn binary_runs(name: &str) -> bool {
+    quiet_command(name)
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// What to tell someone who does not have it.
+///
+/// Lives here, next to the check, rather than in the UI layer: the fact that
+/// this app needs ffmpeg is a property of the capture implementation, and when
+/// capture stops shelling out this string should disappear with it.
+pub const FFMPEG_MISSING_HELP: &str = "\
+This app needs a free tool called ffmpeg to read your webcam, and it is not \
+installed yet.
+
+To install it, open the Start menu, type \"Terminal\" or \"PowerShell\", open \
+it, then copy and paste this line and press Enter:
+
+    winget install --id Gyan.FFmpeg -e
+
+If that does not work, download it from https://www.gyan.dev/ffmpeg/builds/ \
+(choose \"release essentials\"), unzip it, and add its \"bin\" folder to your \
+PATH.
+
+When it has finished installing, close this app and open it again.";
+
 pub trait FrameSource: Send {
     /// `Ok(None)` means the source is exhausted — end of file, end of
     /// directory. A live camera never returns `None`; it blocks.

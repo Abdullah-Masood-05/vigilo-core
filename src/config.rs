@@ -6,11 +6,13 @@
 //! that. Defaults are seeded from `CONTEXT.md`'s measured numbers, corrected
 //! per MODELS.md §4 where the old value was known to be wrong.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DetectError, Result};
+use crate::types::Severity;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -50,8 +52,27 @@ impl Config {
         // violation latches on and never clears.
         check_hysteresis("pose.yaw", t.pose.yaw_enter_deg, t.pose.yaw_exit_deg)?;
         check_hysteresis("pose.pitch", t.pose.pitch_enter_deg, t.pose.pitch_exit_deg)?;
-        check_hysteresis("gaze.yaw", t.gaze.yaw_enter_rad, t.gaze.yaw_exit_rad)?;
-        check_hysteresis("gaze.pitch", t.gaze.pitch_enter_rad, t.gaze.pitch_exit_rad)?;
+        check_hysteresis("gaze.yaw", t.gaze.yaw_enter_deg, t.gaze.yaw_exit_deg)?;
+        check_hysteresis("gaze.pitch", t.gaze.pitch_enter_deg, t.gaze.pitch_exit_deg)?;
+        check_hysteresis("objects.score", t.objects.enter_score, t.objects.clear_score)?;
+
+        // A bucket naming a class the detector can never emit is a threshold
+        // that silently never fires — the quietest possible failure.
+        for (name, bucket) in &t.objects.buckets {
+            if bucket.classes.is_empty() {
+                return Err(DetectError::Config(format!(
+                    "objects.buckets.{name} lists no classes, so it can never fire"
+                )));
+            }
+            for class in &bucket.classes {
+                if !crate::models::objects::COCO_CLASSES.contains(&class.as_str()) {
+                    return Err(DetectError::Config(format!(
+                        "objects.buckets.{name} lists \"{class}\", which is not a COCO class \
+                         this model can produce"
+                    )));
+                }
+            }
+        }
         check_hysteresis(
             "debug_direction",
             t.debug_direction.enter_deg,
@@ -228,7 +249,7 @@ pub struct Thresholds {
     pub gaze: GazeThresholds,
     pub objects: ObjectThresholds,
     pub identity: IdentityThresholds,
-    pub fusion: FusionWeights,
+    pub fusion: FusionConfig,
     pub debug_direction: DebugDirectionThresholds,
 }
 
@@ -319,10 +340,10 @@ pub struct PoseThresholds {
 impl Default for PoseThresholds {
     fn default() -> Self {
         Self {
-            yaw_enter_deg: 25.0,
-            yaw_exit_deg: 18.0,
-            pitch_enter_deg: 20.0,
-            pitch_exit_deg: 14.0,
+            yaw_enter_deg: 30.0,
+            yaw_exit_deg: 22.0,
+            pitch_enter_deg: 25.0,
+            pitch_exit_deg: 18.0,
             hold_ms: 1500,
             clear_ms: 700,
             ema_alpha: 0.35,
@@ -341,10 +362,28 @@ pub struct GazeThresholds {
     pub calibration_variance_ceiling: f64,
     /// Widen thresholds proportionally for noisy setups.
     pub variance_widening: f64,
-    pub yaw_enter_rad: f64,
-    pub yaw_exit_rad: f64,
-    pub pitch_enter_rad: f64,
-    pub pitch_exit_rad: f64,
+    /// Combined-gaze bounds, **in degrees and after `pitch_offset_deg` is
+    /// applied**.
+    ///
+    /// These were radians until fusion landed. Everything that tunes them —
+    /// §18.6's measurements, the pitch offset below, the head-square band —
+    /// is quoted in degrees, and a tuning file holding `0.436` where the
+    /// evidence says `25` is how a unit mismatch survives review. One unit,
+    /// converted once on ingest from `Gaze`, which is the only place radians
+    /// exist.
+    pub yaw_enter_deg: f64,
+    pub yaw_exit_deg: f64,
+    pub pitch_enter_deg: f64,
+    pub pitch_exit_deg: f64,
+    /// Subtracted from raw gaze pitch and eye pitch before any threshold.
+    ///
+    /// §18.6 measured a systematic **+12 to +15°** offset: sitting square at
+    /// the screen, gaze pitch idles around +8 to +16 rather than near zero,
+    /// because the camera sits above the screen. The sign and the separation
+    /// are both correct — down reads −25, up reads +18 — so this is a frame-of
+    /// -reference constant, not a decode fix. Phase 6 calibration measures it
+    /// per user; until then it is one number here.
+    pub pitch_offset_deg: f64,
     pub hold_ms: u64,
     pub clear_ms: u64,
     /// Below this EAR the eyes are closing — suppress gaze rather than
@@ -365,14 +404,15 @@ impl Default for GazeThresholds {
             calibration_min_samples: 30,
             calibration_variance_ceiling: 0.02,
             variance_widening: 1.5,
-            yaw_enter_rad: 0.38,
-            yaw_exit_rad: 0.26,
-            pitch_enter_rad: 0.33,
-            pitch_exit_rad: 0.22,
+            yaw_enter_deg: 25.0,
+            yaw_exit_deg: 18.0,
+            pitch_enter_deg: 25.0,
+            pitch_exit_deg: 18.0,
+            pitch_offset_deg: 12.5,
             hold_ms: 1000,
             clear_ms: 500,
             blink_ear_floor: 0.18,
-            ema_alpha: 0.4,
+            ema_alpha: 0.3,
             min_face_score: 0.5,
         }
     }
@@ -399,18 +439,65 @@ pub struct ObjectThresholds {
     /// Objects are detected independently of face presence. A phone held over
     /// the face is exactly the case the old gating discarded (MODELS.md §4).
     pub require_face_present: bool,
+    /// COCO classes grouped into the things a proctor actually cares about.
+    ///
+    /// §18.5: the phone was detected but labelled `remote` (0.66) and `laptop`
+    /// (0.545) on frames where it was plainly a phone. Matching `allowlist` as
+    /// literal strings threw those away — a real detection lost to a label.
+    /// Confusion between visually similar COCO classes is expected; a bucket
+    /// absorbs it, a string comparison turns it into a false negative.
+    ///
+    /// `laptop` is deliberately **not** in `handheld_device`: the candidate's
+    /// own machine is in shot for the whole exam and would fire continuously.
+    /// It stays arguable without a recompile because this is config.
+    pub buckets: BTreeMap<String, ObjectBucket>,
+    /// Accumulated-score threshold at which a bucket becomes a violation, and
+    /// the level it must fall back through to clear.
+    ///
+    /// §18.5: only 26–42% of frames cleared 0.5 with a phone plainly in shot,
+    /// so a per-sample threshold misses half the seconds it is there. Evidence
+    /// accumulates instead — see [`ObjectThresholds::score_half_life_ms`].
+    pub enter_score: f64,
+    pub clear_score: f64,
+    /// How long an accumulated point of evidence takes to decay by half.
+    ///
+    /// This is what separates "peaky but persistent" from "one noisy frame":
+    /// a phone sampled at 1 Hz keeps topping the score up faster than it
+    /// decays, while a single 0.3 detection fades before it can reach
+    /// `enter_score`.
+    pub score_half_life_ms: u64,
+}
+
+/// One named group of COCO classes judged together.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObjectBucket {
+    pub classes: Vec<String>,
 }
 
 impl Default for ObjectThresholds {
     fn default() -> Self {
+        let bucket = |classes: &[&str]| ObjectBucket {
+            classes: classes.iter().map(|s| s.to_string()).collect(),
+        };
         Self {
-            min_score: 0.4,
+            // Lowered from 0.4 for fusion's benefit: this is now the floor at
+            // which a sample is worth *accumulating*, not the bar at which it
+            // is worth believing on its own. The bar is `enter_score`.
+            min_score: 0.25,
             nms_threshold: 0.45,
             hold_ms: 2000,
             clear_ms: 1000,
             allowlist: ["cell phone", "book"].iter().map(|s| s.to_string()).collect(),
             person_count: 2,
             require_face_present: false,
+            buckets: BTreeMap::from([
+                ("handheld_device".to_string(), bucket(&["cell phone", "remote"])),
+                ("book".to_string(), bucket(&["book"])),
+            ]),
+            enter_score: 1.5,
+            clear_score: 0.6,
+            score_half_life_ms: 3000,
         }
     }
 }
@@ -428,41 +515,66 @@ pub struct IdentityThresholds {
 
 impl Default for IdentityThresholds {
     fn default() -> Self {
-        Self { cosine_enter: 0.32, cosine_exit: 0.42, consecutive_failures: 2 }
+        // Three, not two. At 0.2 Hz that is ~15 s of sustained mismatch before
+        // anything is claimed. Two checks is ~10 s, which sounds close enough
+        // and is not: a candidate who leans out of frame and back can produce
+        // two consecutive bad crops without ever being a different person, and
+        // accusing the wrong candidate of impersonation is the worst output
+        // this system has.
+        Self { cosine_enter: 0.32, cosine_exit: 0.42, consecutive_failures: 3 }
     }
 }
 
-/// Fuse, don't OR (MODELS.md §4). Five independent booleans produce five
-/// independent false-positive streams; a weighted score with the contributing
-/// signals attached is both stronger evidence and reviewable.
+/// Fusion's own numbers: how long a lost signal must stay lost, and how
+/// serious each violation is.
+///
+/// **Severity is a per-rule constant here, deliberately.** MODELS.md §4 argues
+/// for a weighted fused score with co-occurrence escalation, and that is the
+/// right end state — five independent booleans produce five independent
+/// false-positive streams. It is deferred rather than done: scoring is only
+/// worth building once there is a corpus to tune it against, and a per-rule
+/// constant is honest in the meantime in a way a weighted score with invented
+/// weights would not be.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct FusionWeights {
-    pub no_face: f64,
-    pub never_seen: f64,
-    pub multiple_faces: f64,
-    pub head_turned: f64,
-    pub gaze_off: f64,
-    pub prohibited_object: f64,
-    pub identity_drift: f64,
-    /// Score at or above which a fused violation is escalated to High.
-    pub high_severity_score: f64,
-    /// ...and to Critical.
-    pub critical_severity_score: f64,
+pub struct FusionConfig {
+    /// How long pose or gaze must be absent (`Gated`/`Failed`) before that
+    /// absence is itself reported.
+    ///
+    /// The soak (§18.3) measured `pose failed 16` and gaze gated 1.7% — real,
+    /// and invisible to any decision until now. A blink or one failed frame is
+    /// absorbed; a covered camera or a wedged model is not. A proctoring
+    /// system that has gone blind must say so, because "no signal" read as
+    /// "no violation" is the false negative that matters most.
+    pub signal_lost_ms: u64,
+    pub signal_lost_clear_ms: u64,
+    /// Severity per violation kind, keyed by [`crate::types::ViolationKind::as_str`].
+    /// Anything missing from the map is `Medium`.
+    pub severity: BTreeMap<String, Severity>,
 }
 
-impl Default for FusionWeights {
+impl Default for FusionConfig {
     fn default() -> Self {
+        use Severity::*;
         Self {
-            no_face: 0.6,
-            never_seen: 0.9,
-            multiple_faces: 1.0,
-            head_turned: 0.5,
-            gaze_off: 0.45,
-            prohibited_object: 0.9,
-            identity_drift: 1.0,
-            high_severity_score: 1.2,
-            critical_severity_score: 1.8,
+            signal_lost_ms: 5000,
+            signal_lost_clear_ms: 1500,
+            severity: BTreeMap::from([
+                // Nobody ever appeared: the session is worthless and no other
+                // signal can be trusted, so it outranks an ordinary absence.
+                ("never_seen".to_string(), Critical),
+                ("no_face".to_string(), High),
+                // The highest-precision signal there is — a second face is
+                // either there or it is not.
+                ("multiple_faces".to_string(), Critical),
+                ("head_turned_away".to_string(), Medium),
+                ("gaze_off_screen".to_string(), Medium),
+                ("prohibited_object".to_string(), High),
+                ("identity_mismatch".to_string(), Critical),
+                // Not the candidate's fault, but the stretch it covers is
+                // unproctored, which a reviewer must see.
+                ("signal_lost".to_string(), High),
+            ]),
         }
     }
 }
@@ -478,7 +590,21 @@ pub struct RuntimeConfig {
     /// overhead exceeds the win. Sweep 1..cores and pick on p50/p95
     /// (MODELS.md §6 rule 2).
     pub intra_threads_small: usize,
-    /// YOLO's graph is big and its rate is low, so it can use more.
+    /// The object session's budget. Used only by YOLOX-Nano today.
+    ///
+    /// MODELS.md §6 rule 2 reasoned "big graph, so it can use more" — right
+    /// for the object model measured alone, wrong once it runs alongside a
+    /// 15 Hz worker that is never idle. Extra threads here do not make the
+    /// object session's own 1 Hz cadence any more comfortable — 11.6 ms
+    /// against a 1000 ms budget has no need of parallelism — but they do
+    /// compete for the same physical cores the face worker's threads are
+    /// using at that exact moment, on whatever fraction of each second the
+    /// two happen to overlap. Measured cost at 4: the face worker's p50 went
+    /// from 19.5 ms to 37.5 ms with a face in frame, turning off ORT's
+    /// spin-wait (`allow_spinning`, below) made no difference to that gap —
+    /// which is what rules out spinning as the mechanism and points at raw
+    /// thread-count contention instead. At 1, the object session has no
+    /// pool to contend with.
     pub intra_threads_large: usize,
     pub inter_threads: usize,
     /// ORT's constant-cost parallelism model causes high latency variance;
@@ -507,7 +633,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             intra_threads_small: 2,
-            intra_threads_large: 4,
+            intra_threads_large: 1,
             inter_threads: 1,
             dynamic_block_base: 4,
             execution_provider: ExecutionProviderPref::default(),
@@ -528,6 +654,304 @@ pub enum ExecutionProviderPref {
     #[default]
     DirectMlThenCpu,
     CpuOnly,
+}
+
+// ---------------------------------------------------------------------------
+// settings DTOs — the user-facing subset of Config
+// ---------------------------------------------------------------------------
+
+/// The fusion-relevant thresholds a non-developer user sees in the Settings
+/// panel. Deliberately a flat struct of primitives so the frontend can
+/// populate it from form fields without nesting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserThresholds {
+    // -- face --
+    pub no_face_hold_ms: u64,
+    pub no_face_clear_ms: u64,
+    pub never_seen_ms: u64,
+    pub multi_face_hold_ms: u64,
+    pub multi_face_clear_ms: u64,
+
+    // -- head pose --
+    pub pose_yaw_enter_deg: f64,
+    pub pose_yaw_exit_deg: f64,
+    pub pose_pitch_enter_deg: f64,
+    pub pose_pitch_exit_deg: f64,
+    pub pose_hold_ms: u64,
+    pub pose_clear_ms: u64,
+
+    // -- gaze --
+    pub gaze_yaw_enter_deg: f64,
+    pub gaze_yaw_exit_deg: f64,
+    pub gaze_pitch_enter_deg: f64,
+    pub gaze_pitch_exit_deg: f64,
+    pub gaze_pitch_offset_deg: f64,
+    pub gaze_hold_ms: u64,
+    pub gaze_clear_ms: u64,
+
+    // -- objects --
+    pub object_hold_ms: u64,
+    pub object_clear_ms: u64,
+    pub object_enter_score: f64,
+    pub object_clear_score: f64,
+    pub object_score_half_life_ms: u64,
+
+    // -- identity --
+    pub identity_cosine_enter: f64,
+    pub identity_cosine_exit: f64,
+    pub identity_consecutive_failures: u32,
+
+    // -- fusion --
+    pub signal_lost_ms: u64,
+    pub signal_lost_clear_ms: u64,
+
+    // -- severity map (keyed by ViolationKind::as_str) --
+    pub severity: BTreeMap<String, Severity>,
+}
+
+impl Default for UserThresholds {
+    fn default() -> Self {
+        Self::from_config(&Config::default())
+    }
+}
+
+impl UserThresholds {
+    pub fn from_config(cfg: &Config) -> Self {
+        let t = &cfg.thresholds;
+        Self {
+            no_face_hold_ms: t.face.no_face_hold_ms,
+            no_face_clear_ms: t.face.no_face_clear_ms,
+            never_seen_ms: t.face.never_seen_ms,
+            multi_face_hold_ms: t.face.multi_face_hold_ms,
+            multi_face_clear_ms: t.face.multi_face_clear_ms,
+
+            pose_yaw_enter_deg: t.pose.yaw_enter_deg,
+            pose_yaw_exit_deg: t.pose.yaw_exit_deg,
+            pose_pitch_enter_deg: t.pose.pitch_enter_deg,
+            pose_pitch_exit_deg: t.pose.pitch_exit_deg,
+            pose_hold_ms: t.pose.hold_ms,
+            pose_clear_ms: t.pose.clear_ms,
+
+            gaze_yaw_enter_deg: t.gaze.yaw_enter_deg,
+            gaze_yaw_exit_deg: t.gaze.yaw_exit_deg,
+            gaze_pitch_enter_deg: t.gaze.pitch_enter_deg,
+            gaze_pitch_exit_deg: t.gaze.pitch_exit_deg,
+            gaze_pitch_offset_deg: t.gaze.pitch_offset_deg,
+            gaze_hold_ms: t.gaze.hold_ms,
+            gaze_clear_ms: t.gaze.clear_ms,
+
+            object_hold_ms: t.objects.hold_ms,
+            object_clear_ms: t.objects.clear_ms,
+            object_enter_score: t.objects.enter_score,
+            object_clear_score: t.objects.clear_score,
+            object_score_half_life_ms: t.objects.score_half_life_ms,
+
+            identity_cosine_enter: t.identity.cosine_enter,
+            identity_cosine_exit: t.identity.cosine_exit,
+            identity_consecutive_failures: t.identity.consecutive_failures,
+
+            signal_lost_ms: t.fusion.signal_lost_ms,
+            signal_lost_clear_ms: t.fusion.signal_lost_clear_ms,
+            severity: t.fusion.severity.clone(),
+        }
+    }
+
+    /// Merge user values into a full Config, leaving non-user fields untouched.
+    pub fn apply_to(&self, cfg: &mut Config) {
+        let t = &mut cfg.thresholds;
+        t.face.no_face_hold_ms = self.no_face_hold_ms;
+        t.face.no_face_clear_ms = self.no_face_clear_ms;
+        t.face.never_seen_ms = self.never_seen_ms;
+        t.face.multi_face_hold_ms = self.multi_face_hold_ms;
+        t.face.multi_face_clear_ms = self.multi_face_clear_ms;
+
+        t.pose.yaw_enter_deg = self.pose_yaw_enter_deg;
+        t.pose.yaw_exit_deg = self.pose_yaw_exit_deg;
+        t.pose.pitch_enter_deg = self.pose_pitch_enter_deg;
+        t.pose.pitch_exit_deg = self.pose_pitch_exit_deg;
+        t.pose.hold_ms = self.pose_hold_ms;
+        t.pose.clear_ms = self.pose_clear_ms;
+
+        t.gaze.yaw_enter_deg = self.gaze_yaw_enter_deg;
+        t.gaze.yaw_exit_deg = self.gaze_yaw_exit_deg;
+        t.gaze.pitch_enter_deg = self.gaze_pitch_enter_deg;
+        t.gaze.pitch_exit_deg = self.gaze_pitch_exit_deg;
+        t.gaze.pitch_offset_deg = self.gaze_pitch_offset_deg;
+        t.gaze.hold_ms = self.gaze_hold_ms;
+        t.gaze.clear_ms = self.gaze_clear_ms;
+
+        t.objects.hold_ms = self.object_hold_ms;
+        t.objects.clear_ms = self.object_clear_ms;
+        t.objects.enter_score = self.object_enter_score;
+        t.objects.clear_score = self.object_clear_score;
+        t.objects.score_half_life_ms = self.object_score_half_life_ms;
+
+        t.identity.cosine_enter = self.identity_cosine_enter;
+        t.identity.cosine_exit = self.identity_cosine_exit;
+        t.identity.consecutive_failures = self.identity_consecutive_failures;
+
+        t.fusion.signal_lost_ms = self.signal_lost_ms;
+        t.fusion.signal_lost_clear_ms = self.signal_lost_clear_ms;
+        t.fusion.severity = self.severity.clone();
+    }
+}
+
+/// Advanced internals hidden behind "Developer Options" in the UI.
+/// Changing these can affect performance and should be done with care.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DevThresholds {
+    // -- face internals --
+    pub face_min_score: f64,
+    pub face_nms_threshold: f64,
+    pub face_top_k: usize,
+    pub face_multi_face_count: usize,
+
+    // -- pose internals --
+    pub pose_ema_alpha: f64,
+    pub pose_crop_expand: f64,
+
+    // -- gaze internals --
+    pub gaze_calibration_ms: u64,
+    pub gaze_calibration_min_samples: usize,
+    pub gaze_calibration_variance_ceiling: f64,
+    pub gaze_variance_widening: f64,
+    pub gaze_blink_ear_floor: f64,
+    pub gaze_ema_alpha: f64,
+    pub gaze_min_face_score: f64,
+
+    // -- object internals --
+    pub object_min_score: f64,
+    pub object_nms_threshold: f64,
+
+    // -- cadence --
+    pub cadence_face_hz: f64,
+    pub cadence_object_hz: f64,
+    pub cadence_identity_hz: f64,
+
+    // -- runtime --
+    pub runtime_intra_threads_small: usize,
+    pub runtime_intra_threads_large: usize,
+    pub runtime_inter_threads: usize,
+    pub runtime_warmup_iters: u32,
+    pub runtime_allow_spinning: bool,
+    pub runtime_evidence_per_minute: u32,
+
+    // -- debug direction --
+    pub direction_enter_deg: f64,
+    pub direction_exit_deg: f64,
+}
+
+impl Default for DevThresholds {
+    fn default() -> Self {
+        Self::from_config(&Config::default())
+    }
+}
+
+impl DevThresholds {
+    pub fn from_config(cfg: &Config) -> Self {
+        let t = &cfg.thresholds;
+        Self {
+            face_min_score: t.face.min_score,
+            face_nms_threshold: t.face.nms_threshold,
+            face_top_k: t.face.top_k,
+            face_multi_face_count: t.face.multi_face_count,
+
+            pose_ema_alpha: t.pose.ema_alpha,
+            pose_crop_expand: t.pose.crop_expand,
+
+            gaze_calibration_ms: t.gaze.calibration_ms,
+            gaze_calibration_min_samples: t.gaze.calibration_min_samples,
+            gaze_calibration_variance_ceiling: t.gaze.calibration_variance_ceiling,
+            gaze_variance_widening: t.gaze.variance_widening,
+            gaze_blink_ear_floor: t.gaze.blink_ear_floor,
+            gaze_ema_alpha: t.gaze.ema_alpha,
+            gaze_min_face_score: t.gaze.min_face_score,
+
+            object_min_score: t.objects.min_score,
+            object_nms_threshold: t.objects.nms_threshold,
+
+            cadence_face_hz: cfg.cadence.face_hz,
+            cadence_object_hz: cfg.cadence.object_hz,
+            cadence_identity_hz: cfg.cadence.identity_hz,
+
+            runtime_intra_threads_small: cfg.runtime.intra_threads_small,
+            runtime_intra_threads_large: cfg.runtime.intra_threads_large,
+            runtime_inter_threads: cfg.runtime.inter_threads,
+            runtime_warmup_iters: cfg.runtime.warmup_iters,
+            runtime_allow_spinning: cfg.runtime.allow_spinning,
+            runtime_evidence_per_minute: cfg.runtime.evidence_per_minute,
+
+            direction_enter_deg: t.debug_direction.enter_deg,
+            direction_exit_deg: t.debug_direction.exit_deg,
+        }
+    }
+
+    /// Merge developer values into a full Config.
+    ///
+    /// **NOTE**: cadence and runtime fields are informational only in this
+    /// implementation. They are persisted and shown, but changing them at
+    /// runtime has no effect because ORT sessions and worker cadences are
+    /// set at startup. A restart is needed for those to take effect.
+    pub fn apply_to(&self, cfg: &mut Config) {
+        let t = &mut cfg.thresholds;
+        t.face.min_score = self.face_min_score;
+        t.face.nms_threshold = self.face_nms_threshold;
+        t.face.top_k = self.face_top_k;
+        t.face.multi_face_count = self.face_multi_face_count;
+
+        t.pose.ema_alpha = self.pose_ema_alpha;
+        t.pose.crop_expand = self.pose_crop_expand;
+
+        t.gaze.calibration_ms = self.gaze_calibration_ms;
+        t.gaze.calibration_min_samples = self.gaze_calibration_min_samples;
+        t.gaze.calibration_variance_ceiling = self.gaze_calibration_variance_ceiling;
+        t.gaze.variance_widening = self.gaze_variance_widening;
+        t.gaze.blink_ear_floor = self.gaze_blink_ear_floor;
+        t.gaze.ema_alpha = self.gaze_ema_alpha;
+        t.gaze.min_face_score = self.gaze_min_face_score;
+
+        t.objects.min_score = self.object_min_score;
+        t.objects.nms_threshold = self.object_nms_threshold;
+
+        cfg.cadence.face_hz = self.cadence_face_hz;
+        cfg.cadence.object_hz = self.cadence_object_hz;
+        cfg.cadence.identity_hz = self.cadence_identity_hz;
+
+        cfg.runtime.intra_threads_small = self.runtime_intra_threads_small;
+        cfg.runtime.intra_threads_large = self.runtime_intra_threads_large;
+        cfg.runtime.inter_threads = self.runtime_inter_threads;
+        cfg.runtime.warmup_iters = self.runtime_warmup_iters;
+        cfg.runtime.allow_spinning = self.runtime_allow_spinning;
+        cfg.runtime.evidence_per_minute = self.runtime_evidence_per_minute;
+
+        t.debug_direction.enter_deg = self.direction_enter_deg;
+        t.debug_direction.exit_deg = self.direction_exit_deg;
+    }
+}
+
+/// The complete settings payload sent between frontend and backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingsPayload {
+    pub user: UserThresholds,
+    pub dev: DevThresholds,
+}
+
+impl SettingsPayload {
+    pub fn from_config(cfg: &Config) -> Self {
+        Self {
+            user: UserThresholds::from_config(cfg),
+            dev: DevThresholds::from_config(cfg),
+        }
+    }
+
+    /// Apply both user and dev settings to a Config, then validate.
+    pub fn apply_to(&self, cfg: &mut Config) -> Result<()> {
+        self.user.apply_to(cfg);
+        self.dev.apply_to(cfg);
+        cfg.validate()
+    }
 }
 
 #[cfg(test)]
@@ -552,9 +976,9 @@ mod tests {
     #[test]
     fn partial_toml_fills_the_rest_from_defaults() {
         // Tuning a single number must not require restating the whole file.
-        let cfg: Config = toml::from_str("[thresholds.pose]\nyaw_enter_deg = 30.0\n").unwrap();
-        assert_eq!(cfg.thresholds.pose.yaw_enter_deg, 30.0);
-        assert_eq!(cfg.thresholds.pose.yaw_exit_deg, 18.0);
+        let cfg: Config = toml::from_str("[thresholds.pose]\nyaw_enter_deg = 35.0\n").unwrap();
+        assert_eq!(cfg.thresholds.pose.yaw_enter_deg, 35.0);
+        assert_eq!(cfg.thresholds.pose.yaw_exit_deg, 22.0);
         assert_eq!(cfg.capture.width, 1280);
     }
 

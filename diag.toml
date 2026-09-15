@@ -1,0 +1,90 @@
+[capture]
+device_index = 0
+width = 1280
+height = 720
+fps = 30
+prefer_mjpeg = true
+
+[models]
+variant = "auto"
+
+[cadence]
+face_hz = 15.0
+object_hz = 1.0
+identity_hz = 0.2
+
+[thresholds.face]
+min_score = 0.6
+nms_threshold = 0.3
+top_k = 200
+no_face_hold_ms = 2500
+no_face_clear_ms = 500
+never_seen_ms = 10000
+multi_face_count = 2
+multi_face_hold_ms = 2000
+multi_face_clear_ms = 1000
+
+[thresholds.pose]
+yaw_enter_deg = 25.0
+yaw_exit_deg = 18.0
+pitch_enter_deg = 20.0
+pitch_exit_deg = 14.0
+hold_ms = 1500
+clear_ms = 700
+ema_alpha = 0.35
+crop_expand = 0.25
+
+[thresholds.gaze]
+calibration_ms = 3000
+calibration_min_samples = 30
+calibration_variance_ceiling = 0.02
+variance_widening = 1.5
+yaw_enter_rad = 0.38
+yaw_exit_rad = 0.26
+pitch_enter_rad = 0.33
+pitch_exit_rad = 0.22
+hold_ms = 1000
+clear_ms = 500
+blink_ear_floor = 0.18
+ema_alpha = 0.4
+min_face_score = 0.5
+
+[thresholds.objects]
+min_score = 0.05
+nms_threshold = 0.45
+hold_ms = 2000
+clear_ms = 1000
+allowlist = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"]
+person_count = 2
+require_face_present = false
+
+[thresholds.identity]
+cosine_enter = 0.32
+cosine_exit = 0.42
+consecutive_failures = 2
+
+[thresholds.fusion]
+no_face = 0.6
+never_seen = 0.9
+multiple_faces = 1.0
+head_turned = 0.5
+gaze_off = 0.45
+prohibited_object = 0.9
+identity_drift = 1.0
+high_severity_score = 1.2
+critical_severity_score = 1.8
+
+[thresholds.debug_direction]
+enter_deg = 8.0
+exit_deg = 5.0
+
+[runtime]
+intra_threads_small = 2
+intra_threads_large = 4
+inter_threads = 1
+dynamic_block_base = 4
+execution_provider = "direct_ml_then_cpu"
+warmup_iters = 5
+variant_bench_iters = 20
+allow_spinning = false
+evidence_per_minute = 6
