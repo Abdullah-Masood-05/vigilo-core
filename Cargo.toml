@@ -9,6 +9,12 @@ description = "High-performance multimodal exam proctoring and behavioral stream
 name = "vigilo_core"
 path = "src/lib.rs"
 
+[features]
+default = []
+gpu-directml = ["ort/directml"]
+gpu-cuda = ["ort/cuda"]
+gpu-coreml = ["ort/coreml"]
+
 [[bin]]
 name = "detect-cli"
 path = "src/bin/detect-cli.rs"

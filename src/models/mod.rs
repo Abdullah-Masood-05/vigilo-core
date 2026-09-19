@@ -147,6 +147,26 @@ pub fn build_session(path: impl AsRef<Path>, rt: &RuntimeConfig, large: bool) ->
             // the face worker's p50 tripled once a second session existed.
             .with_intra_op_spinning(rt.allow_spinning)?
             .with_inter_op_spinning(rt.allow_spinning)?;
+
+        #[cfg(feature = "gpu-directml")]
+        {
+            builder = builder.with_execution_providers([
+                ort::ep::DirectML::default().build()
+            ])?;
+        }
+        #[cfg(feature = "gpu-cuda")]
+        {
+            builder = builder.with_execution_providers([
+                ort::ep::CUDA::default().build()
+            ])?;
+        }
+        #[cfg(feature = "gpu-coreml")]
+        {
+            builder = builder.with_execution_providers([
+                ort::ep::CoreML::default().build()
+            ])?;
+        }
+
         // `enable_cpu_mem_arena` is left ON deliberately: disabling it saves
         // memory but ORT's own docs say it increases latency.
         builder.commit_from_file(path)
